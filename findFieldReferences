@@ -1,0 +1,484 @@
+/**
+ * Field Reference Finder
+ * ----------------------
+ * Reads field names from an input Excel file, searches all Salesforce metadata
+ * files in force-app/, and writes an output Excel with every match found.
+ *
+ * Usage:
+ *   node scripts/findFieldReferences.js
+ *   node scripts/findFieldReferences.js --input my_fields.xlsx
+ *
+ * Input columns : "ObjectApiName"  "FieldApiName"
+ * Output        : field_references_output.xlsx in project root (3 tabs)
+ *
+ * One-time setup: npm install -g exceljs
+ */
+
+const fs   = require('fs');
+const path = require('path');
+const { execSync } = require('child_process');
+
+// ---------------------------------------------------------------------------
+// CLI argument parsing  --input <file>
+// ---------------------------------------------------------------------------
+function parseArgs() {
+  const args   = process.argv.slice(2);
+  let inputArg = null;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--input' && args[i + 1]) inputArg = args[++i];
+  }
+  return { inputArg };
+}
+
+// ---------------------------------------------------------------------------
+// ANSI colour helpers (auto-disabled when not a TTY)
+// ---------------------------------------------------------------------------
+const isTTY = process.stdout.isTTY;
+const c = {
+  reset:  isTTY ? '\x1b[0m'  : '',
+  bold:   isTTY ? '\x1b[1m'  : '',
+  dim:    isTTY ? '\x1b[2m'  : '',
+  cyan:   isTTY ? '\x1b[36m' : '',
+  green:  isTTY ? '\x1b[32m' : '',
+  yellow: isTTY ? '\x1b[33m' : '',
+  red:    isTTY ? '\x1b[31m' : '',
+  blue:   isTTY ? '\x1b[34m' : '',
+  white:  isTTY ? '\x1b[97m' : '',
+};
+
+function log(msg)              { console.log(msg); }
+function step(n, total, msg)   { log(`${c.bold}${c.cyan}  [${n}/${total}]${c.reset} ${msg}`); }
+function info(msg)             { log(`${c.dim}         ${msg}${c.reset}`); }
+function ok(msg)               { log(`${c.green}    ✔  ${c.reset}${msg}`); }
+function warn(msg)             { log(`${c.yellow}    ⚠  ${c.reset}${msg}`); }
+function err(msg)              { log(`${c.red}    ✖  ${c.reset}${msg}`); }
+
+function progressBar(done, total, label) {
+  if (!isTTY) return;
+  const WIDTH  = 30;
+  const pct    = total === 0 ? 100 : Math.floor((done / total) * 100);
+  const filled = Math.round((done / total) * WIDTH);
+  const bar    = '█'.repeat(filled) + '░'.repeat(WIDTH - filled);
+  process.stdout.write(
+    `\r${c.dim}         [${c.cyan}${bar}${c.dim}] ${c.white}${pct}%${c.reset}  ${c.dim}${label}${c.reset}   `
+  );
+}
+function clearProgress() {
+  if (!isTTY) return;
+  process.stdout.write('\r' + ' '.repeat(80) + '\r');
+}
+
+// ---------------------------------------------------------------------------
+// Resolve exceljs — local first, then global npm
+// ---------------------------------------------------------------------------
+function loadExcelJS() {
+  // 1. Local node_modules (if npm install was run in this project)
+  try { return require('exceljs'); } catch { /* continue */ }
+
+  // 2. Global npm root
+  try {
+    const globalRoot = execSync('npm root -g').toString().trim();
+    return require(path.join(globalRoot, 'exceljs'));
+  } catch { /* continue */ }
+
+  err('exceljs not found.');
+  err('Fix: run  npm install -g exceljs  in your terminal, then retry.');
+  process.exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// Paths (overridable via CLI args)
+// ---------------------------------------------------------------------------
+const PROJECT_ROOT = path.resolve(__dirname, '..');
+const SEARCH_ROOT  = path.join(PROJECT_ROOT, 'force-app', 'main', 'default');
+
+const { inputArg } = parseArgs();
+const INPUT_FILE  = inputArg
+  ? path.resolve(process.cwd(), inputArg)
+  : path.join(__dirname, 'input_fields.xlsx');
+const OUTPUT_FILE = path.join(PROJECT_ROOT, 'field_references_output.xlsx');
+
+// ---------------------------------------------------------------------------
+// Metadata type detection from file path
+// ---------------------------------------------------------------------------
+function getMetadataType(filePath) {
+  const rel = filePath.replace(SEARCH_ROOT, '');
+  if (rel.startsWith(path.sep + 'classes'))        return 'Apex Class';
+  if (rel.startsWith(path.sep + 'triggers'))       return 'Apex Trigger';
+  if (rel.startsWith(path.sep + 'lwc'))            return 'LWC';
+  if (rel.startsWith(path.sep + 'aura'))           return 'Aura Component';
+  if (rel.startsWith(path.sep + 'pages'))          return 'Visualforce Page';
+  if (rel.startsWith(path.sep + 'components'))     return 'Visualforce Component';
+  if (rel.startsWith(path.sep + 'layouts'))        return 'Layout';
+  if (rel.startsWith(path.sep + 'objects'))        return 'Object Metadata';
+  if (rel.startsWith(path.sep + 'permissionsets')) return 'Permission Set';
+  if (rel.startsWith(path.sep + 'flexipages'))     return 'FlexiPage';
+  return 'Other';
+}
+
+// ---------------------------------------------------------------------------
+// Recursively collect all files under a directory
+// ---------------------------------------------------------------------------
+function getAllFiles(dir, results = []) {
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) getAllFiles(full, results);
+    else results.push(full);
+  }
+  return results;
+}
+
+// ---------------------------------------------------------------------------
+// Timer helper
+// ---------------------------------------------------------------------------
+function elapsed(startMs) {
+  return `${((Date.now() - startMs) / 1000).toFixed(1)}s`;
+}
+
+// ---------------------------------------------------------------------------
+// Shared Excel header style helper
+// ---------------------------------------------------------------------------
+function applyHeaderStyle(row) {
+  row.eachCell((cell) => {
+    cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2E4057' } };
+    cell.font      = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
+    cell.alignment = { vertical: 'middle', horizontal: 'center' };
+    cell.border    = { bottom: { style: 'thin', color: { argb: 'FFAAAAAA' } } };
+  });
+  row.height = 20;
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+async function main() {
+  const totalStart  = Date.now();
+  const TOTAL_STEPS = 4;
+
+  // Banner
+  log('');
+  log(`${c.bold}${c.blue}  ╔══════════════════════════════════════════╗${c.reset}`);
+  log(`${c.bold}${c.blue}  ║     Salesforce Field Reference Finder    ║${c.reset}`);
+  log(`${c.bold}${c.blue}  ╚══════════════════════════════════════════╝${c.reset}`);
+  log('');
+
+  if (inputArg) info(`Custom input : ${INPUT_FILE}`);
+  if (inputArg) log('');
+
+  // ── STEP 1 — Read input Excel ────────────────────────────────────────────
+  step(1, TOTAL_STEPS, 'Reading input Excel…');
+  info(`Input : ${INPUT_FILE}`);
+
+  if (!fs.existsSync(INPUT_FILE)) {
+    err(`Input file not found: ${INPUT_FILE}`);
+    err('Usage: node scripts/findFieldReferences.js [--input <file>]');
+    process.exit(1);
+  }
+
+  const t1      = Date.now();
+  const ExcelJS = loadExcelJS();
+  const inWb    = new ExcelJS.Workbook();
+  await inWb.xlsx.readFile(INPUT_FILE);
+  const inSheet = inWb.worksheets[0];
+
+  let objectCol = null;
+  let fieldCol  = null;
+  inSheet.getRow(1).eachCell((cell, col) => {
+    const val = String(cell.value || '').trim();
+    if (val === 'ObjectApiName') objectCol = col;
+    if (val === 'FieldApiName')  fieldCol  = col;
+  });
+
+  if (!objectCol || !fieldCol) {
+    err('Could not find columns "ObjectApiName" and "FieldApiName" in row 1.');
+    process.exit(1);
+  }
+
+  const fields = [];
+  inSheet.eachRow((row, rowNumber) => {
+    if (rowNumber === 1) return;
+    const objectName = String(row.getCell(objectCol).value || '').trim();
+    const fieldName  = String(row.getCell(fieldCol).value  || '').trim();
+    if (fieldName) fields.push({ objectName, fieldName });
+  });
+
+  ok(`Loaded ${c.bold}${fields.length} fields${c.reset} from input  ${c.dim}(${elapsed(t1)})${c.reset}`);
+  log('');
+
+  // ── STEP 2 — Discover files ──────────────────────────────────────────────
+  step(2, TOTAL_STEPS, 'Discovering project files…');
+
+  if (!fs.existsSync(SEARCH_ROOT)) {
+    err(`Search root not found: ${SEARCH_ROOT}`);
+    process.exit(1);
+  }
+
+  const t2       = Date.now();
+  const allFiles = getAllFiles(SEARCH_ROOT);
+  ok(`Found ${c.bold}${allFiles.length} files${c.reset} in force-app/main/default/  ${c.dim}(${elapsed(t2)})${c.reset}`);
+  log('');
+
+  // ── STEP 3 — Search files ────────────────────────────────────────────────
+  step(3, TOTAL_STEPS, `Searching ${allFiles.length} files for ${fields.length} fields…`);
+
+  const fieldNameSet = new Set(fields.map((f) => f.fieldName.toLowerCase()));
+
+  // matchMap: fieldNameLower -> Map<filePath, { metadataType, fileName, filePath, lines[] }>
+  const matchMap = new Map();
+  fields.forEach((f) => matchMap.set(f.fieldName.toLowerCase(), new Map()));
+
+  const t3              = Date.now();
+  let filesScanned      = 0;
+  let totalMatchesFound = 0;
+  const PROGRESS_EVERY  = 500;
+
+  for (const filePath of allFiles) {
+    filesScanned++;
+
+    if (filesScanned % PROGRESS_EVERY === 0 || filesScanned === allFiles.length) {
+      progressBar(filesScanned, allFiles.length,
+        `${filesScanned} / ${allFiles.length} files  |  ${totalMatchesFound} matches so far`);
+    }
+
+    let content;
+    try { content = fs.readFileSync(filePath, 'utf8'); }
+    catch { continue; }
+
+    const metadataType = getMetadataType(filePath);
+    const fileName     = path.basename(filePath);
+    const relPath      = path.relative(PROJECT_ROOT, filePath);
+    const lines        = content.split('\n');
+
+    for (const fieldName of fieldNameSet) {
+      const fileMap = matchMap.get(fieldName);
+      lines.forEach((line, idx) => {
+        if (line.toLowerCase().includes(fieldName)) {
+          if (!fileMap.has(relPath)) {
+            fileMap.set(relPath, { metadataType, fileName, filePath: relPath, lines: [] });
+          }
+          fileMap.get(relPath).lines.push({ lineNumber: idx + 1, lineContent: line.trim() });
+          totalMatchesFound++;
+        }
+      });
+    }
+  }
+
+  clearProgress();
+  ok(`Scan complete — ${c.bold}${totalMatchesFound} line matches${c.reset} across ${filesScanned} files  ${c.dim}(${elapsed(t3)})${c.reset}`);
+  log('');
+
+  // ── STEP 4 — Build rows & write Excel ────────────────────────────────────
+  step(4, TOTAL_STEPS, 'Building output Excel…');
+
+  const t4 = Date.now();
+
+  // Build main rows + collect summary data + not-found list in one pass
+  const rows         = [];   // tab 1
+  const summaryRows  = [];   // tab 2
+  const notFoundRows = [];   // tab 3
+  let foundCount    = 0;
+  let notFoundCount = 0;
+
+  for (const { objectName, fieldName } of fields) {
+    const fileMap = matchMap.get(fieldName.toLowerCase());
+
+    if (!fileMap || fileMap.size === 0) {
+      // ── not found ──────────────────────────────────────────────────────
+      notFoundCount++;
+      rows.push({
+        objectName, fieldName,
+        metadataType: 'NOT FOUND', fileName: 'NOT FOUND',
+        filePath: '-', lineCount: 0, lineNumbers: '-',
+      });
+      notFoundRows.push({ fieldName, objectName });
+      summaryRows.push({
+        fieldName, objectName,
+        filesFoundIn: 'NOT FOUND', totalMatches: 0, metadataTypes: '-',
+      });
+    } else {
+      // ── found ──────────────────────────────────────────────────────────
+      foundCount++;
+      const metadataTypeSet = new Set();
+      let   fieldTotalMatches = 0;
+
+      for (const [, entry] of fileMap) {
+        const lineNumbers = entry.lines.map((l) => l.lineNumber).join(', ');
+        rows.push({
+          objectName, fieldName,
+          metadataType: entry.metadataType,
+          fileName:     entry.fileName,
+          filePath:     entry.filePath,
+          lineCount:    entry.lines.length,
+          lineNumbers,
+        });
+        metadataTypeSet.add(entry.metadataType);
+        fieldTotalMatches += entry.lines.length;
+      }
+
+      summaryRows.push({
+        fieldName,
+        objectName,
+        filesFoundIn:  fileMap.size,
+        totalMatches:  fieldTotalMatches,
+        metadataTypes: [...metadataTypeSet].join(', '),
+      });
+    }
+  }
+
+  info(`Tab 1 rows : ${rows.length}  (grouped by field + file)`);
+  info(`Tab 2 rows : ${summaryRows.length}  (one per field)`);
+  info(`Tab 3 rows : ${notFoundRows.length}  (not found fields)`);
+
+  // ── Write workbook ────────────────────────────────────────────────────────
+  const outWb = new ExcelJS.Workbook();
+
+  // ── TAB 1 — Field References ─────────────────────────────────────────────
+  const sheet1 = outWb.addWorksheet('Field References');
+  sheet1.columns = [
+    { header: 'ObjectApiName',  key: 'objectName',   width: 36 },
+    { header: 'FieldApiName',   key: 'fieldName',    width: 30 },
+    { header: 'Metadata Type',  key: 'metadataType', width: 22 },
+    { header: 'File Name',      key: 'fileName',     width: 42 },
+    { header: 'Match Count',    key: 'lineCount',    width: 13 },
+    { header: 'Line Numbers',   key: 'lineNumbers',  width: 50 },
+    { header: 'File Path',      key: 'filePath',     width: 70 },
+  ];
+  applyHeaderStyle(sheet1.getRow(1));
+  sheet1.views = [{ state: 'frozen', ySplit: 1 }];
+
+  const COLOR_A         = 'FFD6E4F0'; // light blue
+  const COLOR_B         = 'FFD6F0DA'; // light green
+  const NOT_FOUND_COLOR = 'FFFFF3CD'; // light yellow
+
+  let colorToggle   = 0;
+  let lastFieldName = null;
+  let rowsWritten   = 0;
+  const WRITE_EVERY = 200;
+
+  for (const record of rows) {
+    rowsWritten++;
+    if (rowsWritten % WRITE_EVERY === 0 || rowsWritten === rows.length) {
+      progressBar(rowsWritten, rows.length, `Writing tab 1: row ${rowsWritten} / ${rows.length}`);
+    }
+
+    if (record.fieldName !== lastFieldName) {
+      if (record.metadataType !== 'NOT FOUND') colorToggle = colorToggle === 0 ? 1 : 0;
+      lastFieldName = record.fieldName;
+    }
+
+    const rowColor = record.metadataType === 'NOT FOUND'
+      ? NOT_FOUND_COLOR
+      : colorToggle === 0 ? COLOR_A : COLOR_B;
+
+    const dataRow = sheet1.addRow({
+      objectName:   record.objectName,
+      fieldName:    record.fieldName,
+      metadataType: record.metadataType,
+      fileName:     record.fileName,
+      filePath:     record.filePath,
+      lineCount:    record.lineCount || 0,
+      lineNumbers:  record.lineNumbers,
+    });
+
+    dataRow.eachCell((cell) => {
+      cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: rowColor } };
+      cell.alignment = { vertical: 'middle' };
+      cell.border    = { bottom: { style: 'hair', color: { argb: 'FFCCCCCC' } } };
+    });
+  }
+
+  clearProgress();
+  sheet1.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: sheet1.columns.length } };
+
+  // ── TAB 2 — Summary ───────────────────────────────────────────────────────
+  const sheet2 = outWb.addWorksheet('Summary');
+  sheet2.columns = [
+    { header: 'FieldApiName',   key: 'fieldName',     width: 30 },
+    { header: 'ObjectApiName',  key: 'objectName',    width: 36 },
+    { header: 'Files Found In', key: 'filesFoundIn',  width: 15 },
+    { header: 'Total Matches',  key: 'totalMatches',  width: 15 },
+    { header: 'Metadata Types', key: 'metadataTypes', width: 50 },
+  ];
+  applyHeaderStyle(sheet2.getRow(1));
+  sheet2.views = [{ state: 'frozen', ySplit: 1 }];
+
+  let s2colorToggle   = 0;
+  let s2lastFieldName = null;
+
+  for (const rec of summaryRows) {
+    if (rec.fieldName !== s2lastFieldName) {
+      if (rec.filesFoundIn !== 'NOT FOUND') s2colorToggle = s2colorToggle === 0 ? 1 : 0;
+      s2lastFieldName = rec.fieldName;
+    }
+
+    const rowColor = rec.filesFoundIn === 'NOT FOUND'
+      ? NOT_FOUND_COLOR
+      : s2colorToggle === 0 ? COLOR_A : COLOR_B;
+
+    const dataRow = sheet2.addRow({
+      fieldName:    rec.fieldName,
+      objectName:   rec.objectName,
+      filesFoundIn: rec.filesFoundIn,
+      totalMatches: rec.totalMatches,
+      metadataTypes: rec.metadataTypes,
+    });
+
+    dataRow.eachCell((cell) => {
+      cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: rowColor } };
+      cell.alignment = { vertical: 'middle' };
+      cell.border    = { bottom: { style: 'hair', color: { argb: 'FFCCCCCC' } } };
+    });
+  }
+
+  sheet2.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: sheet2.columns.length } };
+
+  // ── TAB 3 — Not Found ─────────────────────────────────────────────────────
+  const sheet3 = outWb.addWorksheet('Not Found');
+  sheet3.columns = [
+    { header: 'FieldApiName',  key: 'fieldName',  width: 30 },
+    { header: 'ObjectApiName', key: 'objectName', width: 36 },
+  ];
+  applyHeaderStyle(sheet3.getRow(1));
+  sheet3.views = [{ state: 'frozen', ySplit: 1 }];
+
+  for (const rec of notFoundRows) {
+    const dataRow = sheet3.addRow({ fieldName: rec.fieldName, objectName: rec.objectName });
+    dataRow.eachCell((cell) => {
+      cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: NOT_FOUND_COLOR } };
+      cell.alignment = { vertical: 'middle' };
+      cell.border    = { bottom: { style: 'hair', color: { argb: 'FFCCCCCC' } } };
+    });
+  }
+
+  // ── Save ──────────────────────────────────────────────────────────────────
+  info('Saving file…');
+  await outWb.xlsx.writeFile(OUTPUT_FILE);
+
+  ok(`Excel saved  ${c.dim}(${elapsed(t4)})${c.reset}`);
+  info(`Output : ${OUTPUT_FILE}`);
+  log('');
+
+  // ── Final summary ─────────────────────────────────────────────────────────
+  log(`${c.bold}${c.blue}  ┌──────────────────────────────────────────────┐${c.reset}`);
+  log(`${c.bold}${c.blue}  │              SUMMARY                         │${c.reset}`);
+  log(`${c.bold}${c.blue}  ├──────────────────────────────────────────────┤${c.reset}`);
+  log(`${c.bold}${c.blue}  │${c.reset}  Total fields searched   : ${c.bold}${String(fields.length).padEnd(16)}${c.reset}${c.blue}│${c.reset}`);
+  log(`${c.bold}${c.blue}  │${c.reset}  Fields with matches     : ${c.green}${c.bold}${String(foundCount).padEnd(16)}${c.reset}${c.blue}│${c.reset}`);
+  log(`${c.bold}${c.blue}  │${c.reset}  Fields NOT found        : ${c.yellow}${c.bold}${String(notFoundCount).padEnd(16)}${c.reset}${c.blue}│${c.reset}`);
+  log(`${c.bold}${c.blue}  │${c.reset}  Tab 1 rows (field+file) : ${c.bold}${String(rows.length).padEnd(16)}${c.reset}${c.blue}│${c.reset}`);
+  log(`${c.bold}${c.blue}  │${c.reset}  Total time              : ${c.bold}${String(elapsed(totalStart)).padEnd(16)}${c.reset}${c.blue}│${c.reset}`);
+  log(`${c.bold}${c.blue}  ├──────────────────────────────────────────────┤${c.reset}`);
+  log(`${c.bold}${c.blue}  │${c.reset}  ${c.bold}Tab 1${c.reset} Field References  (${rows.length} rows)${' '.repeat(Math.max(0, 13 - String(rows.length).length))}${c.blue}│${c.reset}`);
+  log(`${c.bold}${c.blue}  │${c.reset}  ${c.bold}Tab 2${c.reset} Summary           (${summaryRows.length} rows)${' '.repeat(Math.max(0, 13 - String(summaryRows.length).length))}${c.blue}│${c.reset}`);
+  log(`${c.bold}${c.blue}  │${c.reset}  ${c.bold}Tab 3${c.reset} Not Found         (${notFoundRows.length} rows)${' '.repeat(Math.max(0, 13 - String(notFoundRows.length).length))}${c.blue}│${c.reset}`);
+  log(`${c.bold}${c.blue}  └──────────────────────────────────────────────┘${c.reset}`);
+  log('');
+}
+
+main().catch((e) => {
+  log('');
+  err(`Unexpected error: ${e.message}`);
+  log('');
+  process.exit(1);
+});
